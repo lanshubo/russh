@@ -6,11 +6,13 @@ use std::sync::Arc;
 use bytes::Bytes;
 use log::{debug, error, warn};
 use signature::Verifier;
-use ssh_encoding::{Decode, Encode};
-use ssh_key::{Mpint, PublicKey, Signature};
+use ssh_encoding::{Decode, Encode, Reader};
+use ssh_key::{Algorithm, Certificate, Mpint, PublicKey, Signature};
 
 use super::IncomingSshPacket;
+use crate::cert::PublicKeyOrCertificate;
 use crate::client::{Config, NewKeys};
+use crate::helpers::AlgorithmExt;
 use crate::kex::dh::groups::DhGroup;
 use crate::kex::{KexAlgorithm, KexAlgorithmImplementor, KexCause, KexProgress, KEXES};
 use crate::keys::key::parse_public_key;
@@ -37,7 +39,7 @@ enum ClientKexState {
         kex: KexAlgorithm,
     },
     WaitingForNewKeys {
-        server_host_key: PublicKey,
+        server_host_key: PublicKeyOrCertificate,
         newkeys: NewKeys,
     },
 }
@@ -262,19 +264,29 @@ impl ClientKex {
                 #[allow(clippy::indexing_slicing)] // length checked
                 let r = &mut &input.buffer[1..];
 
-                let server_host_key = Bytes::decode(r)?; // server public key.
-                let server_host_key = parse_public_key(&server_host_key)?;
-                debug!(
-                    "received server host key: {:?}",
-                    server_host_key.to_openssh()
-                );
-
+                let mut pubkey_vec = CryptoVec::new();
+                let server_host_key_bytes = Bytes::decode(r)?;
+                let algo = String::decode(&mut &server_host_key_bytes[..])?;
+                let server_host_key = if Algorithm::new_certificate(&algo).is_ok() {
+                    let cert = decode_certificate(&server_host_key_bytes)?;
+                    server_host_key_bytes.as_ref().encode(&mut pubkey_vec)?;
+                    PublicKeyOrCertificate::Certificate(cert)
+                } else {
+                    let public_key = parse_public_key(&server_host_key_bytes)?;
+                    debug!(
+                        "received server host key: {:?}", 
+                        public_key.to_openssh()
+                    );
+                    public_key.to_bytes()?.encode(&mut pubkey_vec)?;
+                    let hash_alg = Algorithm::new(&algo)
+                        .ok()
+                        .and_then(|algorithm| algorithm.hash_alg());
+                    PublicKeyOrCertificate::PublicKey { key: public_key, hash_alg }
+                };
+                
                 let server_ephemeral = Bytes::decode(r)?;
                 self.exchange.server_ephemeral.extend(&server_ephemeral);
                 kex.compute_shared_secret(&self.exchange.server_ephemeral)?;
-
-                let mut pubkey_vec = CryptoVec::new();
-                server_host_key.to_bytes()?.encode(&mut pubkey_vec)?;
 
                 let exchange = &self.exchange;
                 let hash = HASH_BUFFER.with({
@@ -288,7 +300,18 @@ impl ClientKex {
                 let signature = Bytes::decode(r)?;
                 let signature = Signature::decode(&mut &signature[..])?;
 
-                if let Err(e) = Verifier::verify(&server_host_key, hash.as_ref(), &signature) {
+                let verify_result = match &server_host_key {
+                    PublicKeyOrCertificate::PublicKey { key, .. } => {
+                        Verifier::verify(key, hash.as_ref(), &signature)
+                    }
+                    PublicKeyOrCertificate::Certificate(cert) => {
+                        verify_certificate_signature_from_bytes(&server_host_key_bytes)?;
+                        let cert_key: PublicKey = cert.public_key().clone().into();
+                        Verifier::verify(&cert_key, hash.as_ref(), &signature)
+                    }
+                };
+
+                if let Err(e) = verify_result {
                     debug!("wrong server sig: {e:?}");
                     return Err(Error::WrongServerSig);
                 }
@@ -374,4 +397,122 @@ fn compute_keys(
         cipher: c,
         session_id: session_id.clone(),
     })
+}
+
+
+// Attempts to decode OpenSSH certificates, trying to patch invalid time ranges if necessary.
+fn decode_certificate(bytes: &[u8]) -> Result<Certificate, Error> {
+    match Certificate::from_bytes(bytes) {
+        Ok(cert) => Ok(cert),
+        Err(ssh_key::Error::Time) => {
+            warn!("server host certificate has invalid time range, trying to patch");
+            let patched = replace_all_ff_u64(bytes);
+            Certificate::from_bytes(&patched)
+                .map(|cert| cert)
+                .map_err(|err| {
+                    error!("failed to parse server host certificate, {:?}", err);
+                    Error::Kex
+                })
+        }
+        Err(err) => {
+            error!("failed to parse server host certificate, {:?}", err);
+            Err(Error::Kex)
+        }
+    }
+}
+
+// Replaces any 8-byte 0xFF..FF sequences (u64::MAX) with i64::MAX in big-endian
+// form to make OpenSSH “forever” timestamps acceptable to ssh-key decoding.
+fn replace_all_ff_u64(bytes: &[u8]) -> Vec<u8> {
+    let mut patched = bytes.to_vec();
+    let max = i64::MAX as u64;
+    let max_bytes = max.to_be_bytes();
+    if patched.len() < 8 {
+        return patched;
+    }
+    for i in 0..=patched.len() - 8 {
+        if patched[i..i + 8].iter().all(|b| *b == 0xFF) {
+            patched[i..i + 8].copy_from_slice(&max_bytes);
+        }
+    }
+    patched
+}
+
+/// Verify an OpenSSH certificate's signature using the original certificate bytes.
+/// This locates the trailing `signature` string and the preceding `signature_key` (CA pubkey)
+/// inside `cert_bytes`, decodes them and verifies the signature over the certificate
+/// bytes up to (but excluding) the final signature field.
+/// Returns Ok(()) on success, Err(Error::WrongServerSig) on verification failure,
+/// Err(Error::Kex) for parsing/other failures.
+fn verify_certificate_signature_from_bytes(cert_bytes: &[u8]) -> Result<(), Error> {
+    let n = cert_bytes.len();
+    if n < 4 {
+        error!("certificate too short to contain signature");
+        return Err(Error::Kex);
+    }
+
+    // look for signature from the end
+    let mut sig_start: Option<usize> = None;
+    let mut found_signature: Option<Signature> = None;
+    for i in (0..=n - 4).rev() {
+        let mut tail = &cert_bytes[i..];
+        if let Ok(blob) = Bytes::decode(&mut tail) {
+            if tail.is_finished() {
+                if let Ok(sig) = Signature::decode(&mut &blob[..]) {
+                    sig_start = Some(i);
+                    found_signature = Some(sig);
+                    break;
+                }
+            }
+        }
+    }
+    let sig_start = match sig_start {
+        Some(i) => i,
+        None => {
+            error!("failed to locate certificate signature field");
+            return Err(Error::Kex);
+        }
+    };
+
+    // data that was signed (everything before signature length)
+    let signed_part = &cert_bytes[..sig_start];
+    let signature = match found_signature {
+        Some(s) => s,
+        None => {
+            error!("failed to locate certificate signature field");
+            return Err(Error::Kex);
+        }
+    };
+
+    // locate the preceding SSH string (signature_key) which is immediately before signature
+    if sig_start < 4 {
+        error!("certificate too short to contain signature_key");
+        return Err(Error::Kex);
+    }
+    let mut found_sigkey_pub: Option<PublicKey> = None;
+    for j in (0..=sig_start - 4).rev() {
+        let mut mid = &cert_bytes[j..sig_start];
+        if let Ok(blob) = Bytes::decode(&mut mid) {
+            if mid.is_finished() {
+                if let Ok(pubkey) = parse_public_key(&blob) {
+                    found_sigkey_pub = Some(pubkey);
+                    break;
+                }
+            }
+        }
+    }
+    let ca_pub: PublicKey = match found_sigkey_pub {
+        Some(pk) => pk,
+        None => {
+            error!("failed to locate certificate signature_key field");
+            return Err(Error::Kex);
+        }
+    };
+
+    if let Err(e) = Verifier::verify(&ca_pub, signed_part, &signature) {
+        debug!("certificate signature verification failed: {e:?}");
+        return Err(Error::WrongServerSig);
+    }
+
+    Ok(())
 }
