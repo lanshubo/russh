@@ -1008,6 +1008,19 @@ impl Encrypted {
                     buffer,
                 )?;
 
+                // Support RSA SHA-1 signatures for certificates if the feature is enabled.
+                #[cfg(feature = "sha1_sign")]
+                {
+                    let sig = match key.key_data() {
+                        ssh_key::private::KeypairData::Rsa(rsa) => {
+                            signature::Signer::try_sign(&(rsa, None), buffer)?
+                        }
+                        _ => signature::Signer::try_sign(key.deref(), buffer)?,
+                    };
+                    sig.encoded()?.encode(&mut *buffer)?;
+                }
+                
+                #[cfg(not(feature = "sha1_sign"))]
                 // Extend with self-signature.
                 signature::Signer::try_sign(key.deref(), buffer)?
                     .encoded()?

@@ -25,6 +25,7 @@ dsa = ["ssh-key/dsa"]
 ring = ["dep:ring"] # Alternative crypto backend.
 rsa = ["dep:rsa", "dep:pkcs1", "ssh-key/rsa", "ssh-key/rsa-sha1"]
 _bench = ["dep:criterion"]
+sha1_sign = []
 
 [dependencies]
 aes.workspace = true
